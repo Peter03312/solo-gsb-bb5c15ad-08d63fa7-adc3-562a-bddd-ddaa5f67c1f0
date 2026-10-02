@@ -10,6 +10,8 @@
 
 策展人还可为**待发布**包编排**替代素材方案**：为包中至多 6 件入展素材分别指定 1～8 件**现有**替代素材（未指定的素材保持不变；重复编号、非包内原素材或候选不存在均**整次拒绝**）。预览对“每件原素材及其候选中**恰选一件**”的全部组合，按**替换后的去重清单**（沿原清单顺序首次出现去重）重算完整来源链与单站/多站逐站授权资格，仅**全站合格**的方案可选，并按 **替换件数最少 → 最终清单升序 → 原清单顺序的选中编号**（原素材=0，候选按提交顺序 1～8）依次打破并列。预览**只读**，返回替换明细、逐站核验结果、依据版本、原清单与行程指纹；无解时返回**当前清单**的逐站缺口、不修改包。确认在**同一事务**内核对包仍为待发布、依据版本与清单/行程指纹未变，由服务端按同一输入**重算最优方案并再次整站核验**后原子应用；过期、输入不符或重算失格均拒绝且**不部分修改**。既有核验、发布、复制与已发布包冻结规则完全兼容。
 
+策展人还可选取 **2～20 个待发布展览包组成联展批次**一起发布。批次预览**只读、不写入数据**：按包展示**单站或多站逐站**核验结果、批次共同依据版本与每包的清单指纹/行程指纹；只要有包不存在、非待发布或重算失格，就逐包列出缺口且**不提供确认凭据**。确认时必须**原样携带预览凭据**（含每包双指纹与防篡改摘要），服务端在**同一事务**内核对包集合、待发布状态、共同依据版本与各包指纹，并按当前授权及来源关系**重算全部包**；全部合格时，每包先各自封存**不可变发布快照与签名凭证**（与单包发布完全同构），再一起转为已发布。包不存在、凭据缺失/损坏/被篡改、状态或依据变化、清单/行程漂移、或任一包重算失格时，**整批拒绝**——不产生任何快照、凭证或部分发布。原有单包发布入口（含不合格尝试的失败留痕）、凭证导出与离线校验完全兼容。
+
 - 后端：Node.js 20 + Express + better-sqlite3（SQLite，同步事务）
 - 前端：原生 HTML/CSS/JS，无构建步骤
 - 交付：Dockerfile + docker-compose 一键启动，数据库自动初始化
@@ -89,6 +91,12 @@ node test/e2e.js
      - 核验之后授权或来源关系被任何人修改过，返回 `409 STALE_BASIS`，拒绝发布并提示重新核验；
      - 核验不通过（含某站缺授权、行程非法、站间重叠等）返回 `422`，包保持“待发布”，但本次尝试同样留存为不可变记录；
      - 通过则在**单个 SQLite 事务**内写入不可变核验快照（多站：完整**逐站逐节点**结果 JSON + 冻结行程与清单 + 依据版本）并置为“已发布”，同时冻结各站（非待发布包的站次表被触发器拒绝改/删）。
+   - **联展批次发布**（2～20 个待发布包一起发布；页面「展览包」标签页中部的「联展批次发布」面板）：
+     - 勾选若干**待发布**包（单站、多站可混合；至少 2 个、至多 20 个，重复编号自动去重），点「只读预览联展批次」：
+       - 按包展示**单站或多站逐站**核验（失格站展开问题节点、原因与全部来源路径）、每包的**清单指纹与行程指纹**，以及全批次**共同依据版本**；
+       - 只要有包不存在、已非待发布或重算失格，顶部列出失格数与缺失包并逐包给出缺口，**不出现确认按钮**；预览**只读**，不产生任何快照/凭证、不改包状态或依据版本；
+       - 全部合格时返回一次性的**预览凭据**（包集合 + 每包双指纹 + 依据版本 + 防篡改摘要），页面出现「携带预览凭据整批确认」。
+     - 点确认后服务端在**同一事务**内核对包集合、待发布状态、依据版本与各包指纹，并按当前授权及来源关系重算全部包；全部合格才逐包封存不可变快照与签名凭证、一起转为已发布；任一包不存在 / 凭据不符 / 状态或依据变化 / 清单或行程漂移 / 重算失格，**整批拒绝**（页面逐包提示，且不产生快照、凭证或部分发布），需重新预览。
 
 ### 授权变更后的行为（先预演、再确认）
 
@@ -168,6 +176,7 @@ node test/e2e.js
 | 发布闸门 | 无全局错误、无缺失素材、无环、无不合格节点（多站：全部站全部节点），且依据版本未过期 |
 | 报价组合预览 | 只读，不写入任何数据；每站每节点须由一份现有授权或一份所选报价独自覆盖整段展期；同站不可拼接短授权/短报价；共享节点（含跨站）一份报价只计一次；最优=总成本最低→报价数少→输入序号序列字典序最小；已发布包不可预览 |
 | 替代素材方案 | 仅待发布包；至多 6 件原素材各带 1～8 件现有候选，重复编号/非包内原素材/不存在候选整次拒绝；恰选一件、按替换后去重清单重算完整来源链与逐站资格；仅全站合格方案可选，替换件数最少→最终清单升序→原顺序选中编号；预览只读；确认同事务核对状态/依据版本/双指纹并重算，任一不符整体拒绝 |
+| 联展批次发布 | 选取 2～20 个待发布包（单站/多站可混合，去重后计数）；预览按包给逐站结果、共同依据版本与清单/行程双指纹，有包失格即列缺口且不发凭据；确认携带预览凭据，同一事务核对包集合/待发布状态/依据版本/各包双指纹并重算全部包；全部合格逐包封存快照+凭证后一起发布，包不存在/凭据不符/状态或依据变化/任一包失格均整批拒绝，不产生快照、凭证或部分发布；单包发布与失败留痕保持兼容 |
 
 不可变性由数据库强制：`verification_snapshots` 表与多站包发布后的 `package_stops` 行上配置了 `BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何修改或删除都会被 SQLite 直接拒绝。
 
@@ -210,6 +219,8 @@ node test/e2e.js
 | `POST /api/packages/:id/quotes/preview` | **授权报价组合预览（只读）**：求总成本最低的报价组合覆盖全部站次全部来源节点；无解列出站次/节点/来源路径缺口；不写入任何数据；已发布包 `409 PACKAGE_PUBLISHED` |
 | `POST /api/packages/:id/substitutes/preview` | **替代素材方案预览（只读）**：至多 6 件包内原素材各带 1～8 件现有候选，枚举恰选一件的全部组合，取替换最少→最终清单升序→原顺序选中编号的全站合格最优方案；无解返回当前清单逐站缺口 |
 | `POST /api/packages/:id/substitutes/apply` | **确认应用替代方案**：同一事务内核对待发布状态、依据版本、清单/行程指纹并重算最优方案；过期/输入不符/重算失格均整体拒绝，不部分修改 |
+| `POST /api/batch-publish/preview` | **联展批次预览（只读）**：body `{packageIds:[2～20 个]}`；按包返回单站/多站逐站核验、共同依据版本与各包清单/行程指纹；有包失格即列缺口、不发凭据；不写入任何数据 |
+| `POST /api/batch-publish/confirm` | **联展批次确认**：body `{confirmToken:{…预览返回的凭据原样回传…}}`；同一事务核对包集合/待发布状态/依据版本/双指纹并重算全部包，全合格逐包封存快照+凭证并一起发布，否则整批拒绝 |
 | `GET /api/snapshots/:id` | 读取不可变快照完整内容 |
 
 ### 多站巡展 API 调用示例
@@ -570,6 +581,85 @@ curl -s -X POST http://localhost:3000/api/packages/2/substitutes/apply \
 
 > 与既有规则的兼容：替代确认只重写**待发布**包的 `package_items`（不触碰授权、来源关系、`package_stops`、快照与依据版本）；已发布 / 需复核包的冻结规则、发布闸门、失败发布留痕、复制为待发布包、档期与报价预览等既有行为均不变。应用成功后旧的 `applyToken` 立即作废（清单指纹已变），需要再次调整请重新预览。
 
+### 联展批次发布 API 调用示例（2～20 个待发布包整批原子发布）
+
+第 1 步——预览（只读；单站、多站包可混在一个批次）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/batch-publish/preview \
+  -H 'Content-Type: application/json' \
+  -d '{ "packageIds": [12, 13] }'
+# → 200（全部合格）
+# { "ok": true, "mutated": false, "eligible": true,
+#   "basisVersion": 22, "packageCount": 2, "eligibleCount": 2, "blockedCount": 0,
+#   "missingPackageIds": [],
+#   "packages": [
+#     { "packageId": 12, "found": true, "name": "2026 双城巡展包", "status": "draft",
+#       "multiStop": true, "stopCount": 2, "itemCount": 3, "eligible": true, "blockers": [],
+#       "listFingerprint": "5345…", "itineraryFingerprint": "569b…",
+#       "stops": [
+#         { "position": 0, "name": "北京首展", "eligible": true,  "nodeCount": 5, "failingNodeCount": 0, "failingNodes": [] },
+#         { "position": 1, "name": "香港巡展", "eligible": true,  "nodeCount": 5, "failingNodeCount": 0, "failingNodes": [] } ] },
+#     { "packageId": 13, "found": true, "multiStop": false, "stopCount": 1,
+#       "eligible": true, "listFingerprint": "9a1c…", "itineraryFingerprint": "0e77…",
+#       "stops": [ { "position": 0, "eligible": true, "failingNodes": [], … } ] }
+#   ],
+#   "confirmToken": {
+#     "kind": "batch-publish-confirm-v1", "basisVersion": 22,
+#     "packageIds": [12, 13],
+#     "packages": [ { "packageId": 12, "listFingerprint": "5345…", "itineraryFingerprint": "569b…" },
+#                   { "packageId": 13, "listFingerprint": "9a1c…", "itineraryFingerprint": "0e77…" } ],
+#     "createdAt": "2026-10-02T08:00:00.000Z", "digest": "…（防篡改摘要，随凭据一起回传即可，无需自行计算）" } }
+```
+
+有包失格（不存在 / 非待发布 / 重算不合格）时同样返回 `200` 但 `eligible:false`，逐包列出缺口且**不带 `confirmToken`**：
+
+```jsonc
+{ "eligible": false, "blockedCount": 2, "missingPackageIds": [99],
+  "packages": [
+    { "packageId": 12, "found": true, "eligible": false,
+      "blockers": [ { "code": "RECOMPUTE_DISQUALIFIED", "message": "…重算未通过…" } ],
+      "stops": [ { "position": 1, "eligible": false,
+                   "failingNodes": [ { "materialId": 4, "reasonText": ["…短授权不可拼接…"], "paths": [ … ] } ] } ] },
+    { "packageId": 14, "found": true, "status": "published",
+      "blockers": [ { "code": "NOT_DRAFT", "status": "published", "message": "…只有待发布包…" } ] },
+    { "packageId": 99, "found": false, "eligible": false,
+      "blockers": [ { "code": "PACKAGE_NOT_FOUND", "message": "展览包 #99 不存在" } ] } ] }
+```
+
+第 2 步——把预览返回的 `confirmToken` **原样**回传确认：
+
+```bash
+curl -s -X POST http://localhost:3000/api/batch-publish/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{ "confirmToken": { /* 原样粘贴 preview 返回的 confirmToken */ } }'
+# → 201：同一事务内每包封存不可变发布快照 + 签名凭证后一起转为已发布
+# { "ok": true, "mutated": true, "basisVersion": 22, "packageCount": 2,
+#   "packages": [
+#     { "packageId": 12, "snapshotId": 71, "attestationId": 38,
+#       "attestation": { …与单包发布完全同构的自包含签名凭证… },
+#       "package": { "id": 12, "status": "published", … }, "result": { …多站权威重算结果… } },
+#     { "packageId": 13, "snapshotId": 72, "attestationId": 39, "package": { "status": "published", … } } ] }
+```
+
+每包凭证随后都可按既有方式单独导出/离线校验（`GET /api/packages/:id/attestation`、`scripts/verify-attestation.js`）。
+
+拒绝码（均为 4xx；**整批拒绝，不产生任何快照、凭证或部分发布**）：
+
+```text
+400  INVALID_BATCH   packageIds 缺失/非数组/含非正整数；去重后少于 2 个或多于 20 个
+400  TOKEN_REQUIRED  确认请求缺少 confirmToken
+409  TOKEN_MISMATCH  凭据内容不完整、包集合非法、或防篡改摘要不一致（被篡改/伪造/损坏）
+409  STALE_BASIS     预览后授权或来源关系被增删改（共同依据版本变化；details.clientBasis/currentBasis）
+409  BATCH_NOT_DRAFT           预览后其中一包已不再是待发布（如已被单包发布/复核）
+409  BATCH_PACKAGE_CHANGED     预览后某包清单（LIST_CHANGED）或行程（ITINERARY_CHANGED）被修改
+404  BATCH_PACKAGE_NOT_FOUND   确认时其中一包已被删除（details.missing）
+422  BATCH_RECOMPUTE_DISQUALIFIED  同一事务内按当前授权及来源关系重算，任一包未达全站合格
+                                  （details.packages[*].stops 给出逐站缺口）
+```
+
+> 语义与边界：① 预览完全只读——调用前后 `/api/state` 的 `basisVersion`、包状态与快照/凭证表均无变化；② 批次中可以同时包含单站与多站包，逐站结果在各包 `stops[]` 中分别给出；③ 成功确认后预览凭据即一次性作废（包已非待发布，复用返回 `409 BATCH_NOT_DRAFT`）；④ 批次入口不做“失败留痕”（整批不合格在事务回滚中不留任何记录）；原**单包**发布的全部既有行为（`422` 失败尝试仍追加不可变快照、成功响应字段、凭证导出与补发）保持不变。
+
 ## 八、发布凭证：签发、导出与离线独立校验
 
 发布成功（单站或多站）时，服务端在**写入不可变发布快照、置为已发布的同一个 SQLite 事务内**，同时封存一份自包含、可导出的签名凭证（`publish_attestations` 表，与快照表一样有 UPDATE/DELETE 拒绝触发器）。
@@ -698,14 +788,16 @@ details.missingFields = ["…nodes[materialId=…].paths", "…matchedAuthorizat
 │   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（多站影响按站给出）
 │   ├── quotes.js           # 授权报价组合预览（只读）：报价校验、逐站缺口、精确最低成本集合覆盖求解
 │   ├── substitutes.js      # 替代素材方案（只读预览 + 事务确认）：候选校验、去重重算、枚举三级裁决、双指纹并发防护
-│   ├── server.js           # Express API（发布同事务封存凭证、凭证导出/补发、密钥轮换等）
+│   ├── publish.js          # 单包/批次共用的发布封存：清单/行程指纹、事务内重算、同事务快照+签名凭证
+│   ├── batch.js            # 联展批次发布（只读预览 + 单事务整批确认，2～20 个待发布包）：预览凭据、整批核对与原子发布
+│   ├── server.js           # Express API（发布同事务封存凭证、联展批次预览/确认、凭证导出/补发、密钥轮换等）
 │   └── seed.js             # 演示数据
 ├── scripts
 │   ├── verify-attestation.js  # 独立离线凭证校验程序（零依赖：仅凭凭证+公钥复算签名/来源链/逐站覆盖）
 │   └── attestation-keys.js    # 本机签名密钥管理 CLI（init/public/list/export-pub/rotate）
-├── public                  # 浏览器前端（无构建；含多站行程表格编辑器、按站结果渲染与授权报价预览弹层）
+├── public                  # 浏览器前端（无构建；含多站行程表格编辑器、按站结果渲染、授权报价预览弹层、联展批次发布面板）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（274 项，含多站巡展、授权报价预览、替代素材方案、发布凭证签发与离线校验）
+└── test/e2e.js             # 端到端业务规则自检（319 项，含多站巡展、授权报价预览、替代素材方案、发布凭证签发与离线校验、联展批次发布）
 ```

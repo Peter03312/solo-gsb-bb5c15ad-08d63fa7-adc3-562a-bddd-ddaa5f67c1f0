@@ -20,8 +20,10 @@ const { previewChange, commitChange, ChangeError } = require('./changes');
 const { searchSchedule, applySchedule, ScheduleError } = require('./schedule');
 const { previewQuotes, QuoteError } = require('./quotes');
 const { previewSubstitutions, applySubstitutions, SubstituteError } = require('./substitutes');
+const { previewBatchPublish, confirmBatchPublish, BatchError } = require('./batch');
+const { loadPublishView, recompute, sealPublishedPackage } = require('./publish');
 const keyring = require('./attest-keys');
-const { buildAttestation, buildAttestationFromSnapshot, UnsupportedSnapshotError } = require('./attest');
+const { buildAttestationFromSnapshot, UnsupportedSnapshotError } = require('./attest');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -531,25 +533,25 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
     if (req.body.basisVersion === undefined) throw new HttpError(400, '缺少核验依据版本 basisVersion');
     const clientBasis = Number(req.body.basisVersion);
 
+    function currentBasisValue() {
+      return db.prepare("SELECT CAST(value AS INTEGER) FROM meta WHERE key='basis_version'").pluck().get();
+    }
+    function assertPublishable(view, basis) {
+      if (view.pkg.status !== 'draft') throw new HttpError(409, `当前状态为 ${view.pkg.status}，只有待发布包可以发布`);
+      if (basis !== clientBasis) {
+        throw new HttpError(409,
+          `核验依据已过期：核验时版本 ${clientBasis}，当前版本 ${basis}，授权或来源关系在此期间被修改。请重新核验后再发布。`,
+          { code: 'STALE_BASIS', clientBasis, currentBasis: basis });
+      }
+    }
+
     // 事务 A：读取 + 依据版本校验 + 按当前数据重算（单线程写，无并发插入窗口）
     const decision = tx(() => {
-      const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(id);
-      if (!pkg) throw new HttpError(404, '展览包不存在');
-      if (pkg.status !== 'draft') throw new HttpError(409, `当前状态为 ${pkg.status}，只有待发布包可以发布`);
-
-      const currentBasis = db.prepare("SELECT CAST(value AS INTEGER) FROM meta WHERE key='basis_version'").pluck().get();
-      if (clientBasis !== currentBasis) {
-        throw new HttpError(409,
-          `核验依据已过期：核验时版本 ${clientBasis}，当前版本 ${currentBasis}，授权或来源关系在此期间被修改。请重新核验后再发布。`,
-          { code: 'STALE_BASIS', clientBasis, currentBasis });
-      }
-
-      const items = db
-        .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
-        .all(id)
-        .map((r) => r.material_id);
+      const view = loadPublishView(db, id);
+      if (!view) throw new HttpError(404, '展览包不存在');
+      assertPublishable(view, currentBasisValue());
       // 发布时在同一事务内重读行程、清单与授权依据：多站包逐站核验，任一站失败则整包不发布
-      const result = verifyStoredPackage(db, pkg, items);
+      const result = recompute(db, view);
       return { eligible: result.eligible, result };
     });
 
@@ -565,61 +567,25 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
 
     // 合格：事务 B 原子提交：不可变快照 + 发布凭证（同一事务封存）+ published 状态
     const sealed = tx(() => {
-      const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(id);
-      if (!pkg) throw new HttpError(404, '展览包不存在');
-      if (pkg.status !== 'draft') throw new HttpError(409, `当前状态为 ${pkg.status}，只有待发布包可以发布`);
-      const currentBasis = db.prepare("SELECT CAST(value AS INTEGER) FROM meta WHERE key='basis_version'").pluck().get();
-      if (clientBasis !== currentBasis) {
-        throw new HttpError(409,
-          `核验依据已过期：核验时版本 ${clientBasis}，当前版本 ${currentBasis}，授权或来源关系在此期间被修改。请重新核验后再发布。`,
-          { code: 'STALE_BASIS', clientBasis, currentBasis });
-      }
+      const view = loadPublishView(db, id);
+      if (!view) throw new HttpError(404, '展览包不存在');
+      assertPublishable(view, currentBasisValue());
 
       // 事务内最终重读并重算：快照与凭证封存的必须是同一份结果
-      const itemsFinal = db
-        .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
-        .all(id)
-        .map((r) => r.material_id);
-      const resultFinal = verifyStoredPackage(db, pkg, itemsFinal);
+      const resultFinal = recompute(db, view);
       if (!resultFinal.eligible) {
         // 防御性分支（正常路径在事务 A 已判 422）：整体回滚，不封存任何成功记录
         throw new HttpError(422, '核验未通过，拒绝发布：缺少授权或日期不合法。请按核验结果修正后重试。',
           { result: resultFinal });
       }
-
-      const createdAt = nowIso();
-      const payloadText = JSON.stringify(resultFinal);
-      const snap = db.prepare(
-        `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
-         VALUES (?,?,?,?,?,?)`
-      ).run(id, 'publish', resultFinal.basisVersion, 1, payloadText, createdAt);
-      const snapshotId = snap.lastInsertRowid;
-
-      // 与发布快照同一事务封存可导出凭证（清单/来源子图/逐站行程/实际采用条款/规则版本 + 本机签名）
-      const envelope = buildAttestation(db, {
-        result: resultFinal,
-        packageId: id,
-        packageName: pkg.name,
-        snapshotId,
-        snapshotCreatedAt: createdAt,
-        snapshotPayloadText: payloadText,
-        sealContext: 'publish',
-      });
-      db.prepare(
-        `INSERT INTO publish_attestations(package_id, verification_snapshot_id, signer_kid, seal_context, envelope, created_at)
-         VALUES (?,?,?,?,?,?)`
-      ).run(id, snapshotId, envelope.signature.kid, 'publish', JSON.stringify(envelope), createdAt);
-
-      db.prepare("UPDATE packages SET status='published', published_at=?, updated_at=? WHERE id=?")
-        .run(createdAt, createdAt, id);
-      return { snapshotId, envelope, result: resultFinal };
+      return sealPublishedPackage(db, { view, result: resultFinal, sealContext: 'publish' });
     });
 
     res.status(201).json({
       ok: true,
       message: '发布成功：核验快照与素材清单已原子保存（不可变），发布凭证已在同一事务内封存并签名',
       snapshotId: sealed.snapshotId,
-      attestationId: db.prepare('SELECT id FROM publish_attestations WHERE verification_snapshot_id=?').pluck().get(sealed.snapshotId),
+      attestationId: sealed.attestationId,
       attestation: sealed.envelope,
       package: packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(id), true),
       result: sealed.result,
@@ -762,6 +728,44 @@ app.post('/api/packages/:id/substitutes/apply', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 联展批次发布：只读预览 / 单事务确认（2～20 个待发布包整批原子发布） ----------
+app.post('/api/batch-publish/preview', (req, res, next) => {
+  try {
+    const result = previewBatchPublish(db, req.body || {});
+    res.json({
+      ok: true,
+      phase: 'preview',
+      message: result.eligible
+        ? `联展批次预览通过：${result.packageCount} 个待发布包按当前授权及来源关系重算全部合格（共同依据版本 ${result.basisVersion}），可携带预览凭据整批确认；预览未写入任何数据。`
+        : `联展批次预览未通过：${result.blockedCount} 个包失格（含不存在 ${result.missingPackageIds.length} 个），已按包列出缺口，禁止确认；预览未写入任何数据。`,
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/batch-publish/confirm', (req, res, next) => {
+  try {
+    const out = confirmBatchPublish(db, req.body || {});
+    const packages = out.packages.map((s) => ({
+      packageId: s.packageId,
+      snapshotId: s.snapshotId,
+      attestationId: s.attestationId,
+      attestation: s.attestation,
+      result: s.result,
+      package: packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(s.packageId), true),
+    }));
+    res.status(201).json({
+      ok: true,
+      phase: 'confirm',
+      mutated: true,
+      message: `联展批次发布成功：${out.packageCount} 个包已在同一事务内各自封存不可变发布快照与签名凭证并一起转为已发布；任一包失败都会整批拒绝、不产生部分发布。`,
+      basisVersion: out.basisVersion,
+      packageCount: out.packageCount,
+      packages,
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 快照 ----------
 app.get('/api/snapshots/:id', (req, res, next) => {
   try {
@@ -888,7 +892,8 @@ app.post('/api/attestation-keys/rotate', (req, res, next) => {
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
   if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError
-    || err instanceof QuoteError || err instanceof SubstituteError || err instanceof UnsupportedSnapshotError) {
+    || err instanceof QuoteError || err instanceof SubstituteError || err instanceof BatchError
+    || err instanceof UnsupportedSnapshotError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {

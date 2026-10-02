@@ -80,6 +80,22 @@
       </div>
 
       <div id="verifyPanel" class="panel hidden"></div>
+
+      <div class="panel" id="batchPanel">
+        <h2>联展批次发布（2～20 个待发布包整批原子发布）</h2>
+        <div class="small-muted" style="margin-bottom:8px">
+          勾选若干<b>待发布</b>展览包组成联展批次：先只读预览（按包展示单站/多站逐站核验、共同依据版本与各包清单/行程指纹，预览不写入数据）；
+          全部合格才可携带预览凭据<b>整批确认</b>——服务端在同一事务内核对包集合、待发布状态、依据版本与各包双指纹并重算，
+          每包封存不可变发布快照与签名凭证后一起转为已发布；任一包不存在、凭据不符、状态/依据变化或重算失格，<b>整批拒绝、无部分发布</b>。
+        </div>
+        <div id="batchPick" class="pick"></div>
+        <div class="pkg-actions" style="margin-top:10px">
+          <button type="button" class="btn" id="batchPreviewBtn">只读预览联展批次</button>
+          <span id="batchCountHint" class="small-muted">已选 0 个（需 2～20 个）</span>
+        </div>
+        <div id="batchResult" style="margin-top:12px"></div>
+      </div>
+
       <div id="packagesList" class="stack"></div>
     </section>
   </main>
