@@ -1347,4 +1347,165 @@ async function commitPreviewedChange(change, preview, sourceForm) {
   }
 }
 
+// ---- 联展批次发布（2～20 个待发布包：只读预览 + 凭据确认、单事务整批发布） ----
+const BATCH_MIN = 2;
+const BATCH_MAX = 20;
+
+function batchScopeLine(p) {
+  return p.multiStop
+    ? `多站巡展 ${p.stopCount} 站 · 素材 ${p.itemCount} 项`
+    : `${p.medium} / ${p.region} · ${p.useFrom} → ${p.useTo} · 素材 ${p.itemCount} 项`;
+}
+
+// 逐站卡片（单站归一化为 1 站）：合格给概要，失格列问题节点、原因与来源路径
+function batchStopsHtml(stops) {
+  return (stops || []).map((st) => `
+    <div class="stop-card ${st.eligible ? 'stop-ok' : 'stop-bad'}" style="margin-top:6px">
+      <div class="section-title">第 ${st.position + 1} 站：${esc(st.name)}
+        （${esc(st.medium)} / ${esc(st.region)}，${st.useFrom} → ${st.useTo}）
+        ${st.eligible ? '<span class="pill pill-ok">合格</span>' : `<span class="pill pill-bad">失格 ${st.failingNodeCount} 节点</span>`}</div>
+      ${(st.errors || []).map((m) => `<div class="errorline">${esc(m)}</div>`).join('')}
+      ${st.eligible
+        ? `<div class="small-muted">来源链节点 ${st.nodeCount} 个，均有一份未撤销授权独自覆盖该站整段展期。</div>`
+        : (st.failingNodes || []).map(failingNodeCard).join('')}
+    </div>`).join('');
+}
+
+function renderBatchPreview(box, r) {
+  const head = r.eligible
+    ? `<div class="verdict pass">✓ 批次预览通过：${r.packageCount} 个包逐包（逐站）重算全部合格，可整批发布。
+         <span class="sub">共同核验依据版本 <b>${r.basisVersion}</b> ｜ 合格 ${r.eligibleCount}/${r.packageCount} ｜ 预览只读，未写入任何数据、依据版本不变</span></div>`
+    : `<div class="verdict fail">✗ 批次预览不通过：${r.failingCount} 个包失格，已按包列出缺口并禁止确认。
+         <span class="sub">共同核验依据版本 ${r.basisVersion} ｜ 合格 ${r.eligibleCount}/${r.packageCount} ｜ 预览不写入任何数据；请修正失格包后重新预览</span></div>`;
+
+  const globalErrs = r.packages.flatMap((p) =>
+    (p.globalErrors || []).map((m) => `<div class="errorline">包 #${p.packageId}「${esc(p.packageName)}」：${esc(m)}</div>`));
+
+  box.innerHTML = head + globalErrs + r.packages.map((p) => `
+    <div class="impact-pkg" style="border-color:${p.eligible ? '#cfe3d6' : '#f0c9c5'}">
+      <h4>${esc(p.packageName)} <span class="small-muted">#${p.packageId}</span>
+        ${p.multiStop ? '<span class="pill pill-neutral">多站巡展</span>' : '<span class="pill pill-neutral">单站</span>'}
+        ${p.eligible ? '<span class="pill pill-ok">逐站合格</span>' : '<span class="pill pill-bad">失格</span>'}
+      </h4>
+      <div class="small-muted">${esc(batchScopeLine(p))} ｜ 清单指纹 <code>${p.listFingerprint.slice(0, 12)}</code> ｜ 行程指纹 <code>${p.itineraryFingerprint.slice(0, 12)}</code></div>
+      ${batchStopsHtml(p.stops)}
+    </div>`).join('');
+
+  if (r.eligible && r.confirmToken) {
+    box.insertAdjacentHTML('beforeend', `
+      <div class="pkg-actions" style="margin-top:10px">
+        <button type="button" class="btn btn-primary" id="batchConfirmBtn">确认整批发布（${r.packageCount} 个包，同一事务）</button>
+        <span class="small-muted">服务端将核对包集合、待发布状态、共同依据版本与各包清单/行程指纹，并按当前授权与来源关系重算全部包；任一包失格或漂移都整批拒绝，不产生快照、凭证或部分发布。</span>
+      </div>`);
+    $('#batchConfirmBtn').addEventListener('click', () => doBatchConfirm(r));
+  }
+}
+
+async function doBatchConfirm(preview) {
+  if (!confirm(`确认把联展批次的 ${preview.packageCount} 个包一起发布？\n服务端将在同一事务内重算全部包并封存不可变快照与签名凭证；任一包失败则整批拒绝。`)) return;
+  const btn = $('#batchConfirmBtn');
+  btn.disabled = true;
+  try {
+    const r = await api('POST', '/api/batches/confirm', { confirmToken: preview.confirmToken });
+    $('#modalBackdrop').classList.add('hidden');
+    await loadState();
+    toast(`联展批次发布成功：${r.packageCount} 个包已一起转为已发布（快照 ${r.packages.map((p) => '#' + p.snapshotId).join('、')}）`);
+  } catch (err) {
+    btn.disabled = false;
+    if (err.status === 409 || err.status === 422) {
+      const box = $('#batchResult');
+      box.insertAdjacentHTML('beforeend',
+        `<div class="errorline" style="margin-top:10px">整批被拒绝：${esc(errText(err))}（未产生任何快照、凭证或部分发布；请重新预览）</div>`);
+      await loadState();
+      // 刷新弹层内包的可选状态（可能已被他人发布/修改）
+      syncBatchPickState();
+    } else {
+      toast('整批发布失败：' + errText(err), true);
+    }
+  }
+}
+
+function syncBatchPickState() {
+  $$('#batchPick input[type=checkbox]').forEach((cb) => {
+    const id = Number(cb.value);
+    const pkg = state.packages.find((x) => x.id === id);
+    const label = cb.closest('label');
+    if (!pkg) {
+      cb.disabled = true;
+      cb.checked = false;
+      if (label) label.classList.add('pick-disabled');
+      return;
+    }
+    const selectable = pkg.status === 'draft';
+    cb.disabled = !selectable;
+    if (!selectable) cb.checked = false;
+    if (label) label.classList.toggle('pick-disabled', !selectable);
+  });
+  updateBatchSelection();
+}
+
+function updateBatchSelection() {
+  const n = $$('#batchPick input:checked').length;
+  const info = $('#batchPickInfo');
+  if (info) {
+    info.textContent = `已选 ${n} 个（需 ${BATCH_MIN}～${BATCH_MAX} 个待发布包）`;
+    info.style.color = (n >= BATCH_MIN && n <= BATCH_MAX) ? '#14663a' : '#b4590f';
+  }
+  return n;
+}
+
+function openBatchModal() {
+  const drafts = state.packages.filter((p) => p.status === 'draft');
+  $('#modalTitle').textContent = '组建联展批次（2～20 个待发布包）';
+  $('#modalBody').innerHTML = `
+    <div class="small-muted" style="margin-bottom:8px">
+      仅可勾选<b>待发布</b>包（已发布 / 需复核包不可选）。选定后点「逐包预览核验」：
+      预览只读，按包给出单站或多站逐站结果、共同依据版本与各包清单/行程指纹；有包失格即禁止确认。
+    </div>
+    <div id="batchPick" class="pick">
+      ${drafts.length
+        ? drafts.map((p) => `
+          <label title="${esc(batchScopeLine(p))}">
+            <input type="checkbox" value="${p.id}" />
+            ${esc(p.name)} <span class="small-muted">#${p.id}${p.multiStop ? ` · 多站${p.stopCount}站` : ''}</span>
+          </label>`).join('')
+        : '<span class="small-muted">当前没有待发布包，请先在上方新建并保存待发布包。</span>'}
+    </div>
+    <div class="pkg-actions" style="margin-top:8px">
+      <button type="button" class="btn btn-primary btn-small" id="batchPreviewBtn">逐包预览核验（只读）</button>
+      <span id="batchPickInfo" class="small-muted"></span>
+    </div>
+    <div id="batchResult" class="schedule-result" style="margin-top:10px"></div>`;
+  const foot = $('#modalFoot');
+  foot.classList.remove('hidden');
+  foot.innerHTML = `<button class="btn" id="batchClose">关闭</button>`;
+  $('#batchClose').addEventListener('click', () => $('#modalBackdrop').classList.add('hidden'));
+  $('#modalBackdrop').classList.remove('hidden');
+
+  $('#batchPick').addEventListener('change', updateBatchSelection);
+  syncBatchPickState();
+
+  $('#batchPreviewBtn').addEventListener('click', async () => {
+    const ids = $$('#batchPick input:checked').map((cb) => Number(cb.value));
+    const box = $('#batchResult');
+    if (ids.length < BATCH_MIN || ids.length > BATCH_MAX) {
+      box.innerHTML = `<div class="errorline">联展批次需选取 ${BATCH_MIN}～${BATCH_MAX} 个待发布包（当前 ${ids.length} 个）。</div>`;
+      return;
+    }
+    box.innerHTML = '<div class="small-muted">按当前授权与来源关系逐包（逐站）重算中…</div>';
+    try {
+      const r = await api('POST', '/api/batches/preview', { packageIds: ids });
+      renderBatchPreview(box, r);
+    } catch (err) {
+      box.innerHTML = `<div class="errorline">${esc(errText(err))}</div>`;
+      if (err.status === 404 || err.status === 409) {
+        await loadState();
+        syncBatchPickState();
+      }
+    }
+  });
+}
+
+$('#batchFormBtn').addEventListener('click', openBatchModal);
+
 loadState().catch((e) => toast('初始化失败：' + e.message, true));

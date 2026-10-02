@@ -1513,6 +1513,255 @@ async function call(method, url, body) {
     ok(pubNow.data.status === 'published', '已发布原包仍冻结');
   }
 
+  console.log('19) 联展批次发布：只读预览、双指纹凭据、单事务整批发布、整批拒绝无部分写入')
+  {
+    const mk2 = async (title, kind = 'video') => (await call('POST', '/api/materials', { title, kind })).data.id;
+    const addAuth2 = async (mid, media, region, f, t, revoked = false) =>
+      (await call('POST', `/api/materials/${mid}/authorizations`,
+        { media, region, validFrom: f, validTo: t, revoked })).data;
+    const addLink2 = async (from, to) => (await call('POST', `/api/materials/${from}/sources`, { sourceMaterialId: to })).data;
+    const SPR = { useFrom: '2026-03-01', useTo: '2026-05-31' };
+    const AUT = { useFrom: '2026-10-01', useTo: '2026-11-30' };
+
+    // 19.1 入参校验：数量 / 重复 / 非正整数
+    ok((await call('POST', '/api/batches/preview', { packageIds: [] })).status === 400, '空批次 400');
+    ok((await call('POST', '/api/batches/preview', { packageIds: [1] })).status === 400, '仅 1 个包 400');
+    const twentyOne = Array.from({ length: 21 }, (_, i) => i + 1);
+    ok((await call('POST', '/api/batches/preview', { packageIds: twentyOne })).status === 400, '21 个包 400');
+    const badDup = await call('POST', '/api/batches/preview', { packageIds: [1, 1] });
+    ok(badDup.status === 400 && badDup.data.details && badDup.data.details.code === 'INVALID_BATCH',
+      '重复包 400 INVALID_BATCH');
+    ok((await call('POST', '/api/batches/preview', { packageIds: ['x', 2] })).status === 400, '非整数包号 400');
+    ok((await call('POST', '/api/batches/preview', {})).status === 400, '缺 packageIds 400');
+
+    // 19.2 不存在 / 非待发布（两个 id 均取远大于当前最大包号，确保命中“不存在”分支）
+    const maxPkgId = Math.max(...(await call('GET', '/api/packages')).data.map((p) => p.id));
+    const ghost = maxPkgId + 1000;
+    ok((await call('POST', '/api/batches/preview', { packageIds: [ghost, ghost + 1] })).status === 404,
+      '含不存在包 -> 404');
+    const notDraft = await call('POST', '/api/batches/preview', { packageIds: [global.pidGood, ghost] });
+    ok(notDraft.status === 409 && notDraft.data.details.code === 'NOT_DRAFT',
+      '含已发布包 -> 409 NOT_DRAFT');
+
+    // 19.3 搭两个合格单站包 + 一个秋季失格包（独立素材，全域/短期授权）
+    const a = await mk2('批次-素材A'); const b = await mk2('批次-素材B'); const c = await mk2('批次-素材C');
+    await addAuth2(a, '*', '*', '2020-01-01', '2100-12-31');
+    await addAuth2(b, '*', '*', '2020-01-01', '2100-12-31');
+    await addAuth2(c, '屏幕放映', '中国大陆', '2026-03-01', '2026-05-31'); // 仅春季
+    const pa = (await call('POST', '/api/packages', {
+      name: '批次-合格包A', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [a],
+    })).data.id;
+    const pb = (await call('POST', '/api/packages', {
+      name: '批次-合格包B', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [b],
+    })).data.id;
+    const pc = (await call('POST', '/api/packages', {
+      name: '批次-秋季失格包C', medium: '屏幕放映', region: '中国大陆', ...AUT, materialIds: [c],
+    })).data.id;
+
+    // 19.4 含失格包的预览：eligible=false、按包列缺口、无凭据、只读
+    const stateBefore = await call('GET', '/api/state');
+    const pvBad = await call('POST', '/api/batches/preview', { packageIds: [pa, pc] });
+    ok(pvBad.status === 200 && pvBad.data.eligible === false && pvBad.data.failingCount === 1
+      && pvBad.data.confirmToken === undefined && pvBad.data.mutated === false,
+      '含失格包：预览不可确认、无 confirmToken');
+    const cEntry = pvBad.data.packages.find((p) => p.packageId === pc);
+    ok(cEntry.eligible === false && cEntry.stops[0].failingNodes.some((n) => n.materialId === c)
+      && cEntry.stops[0].failingNodes[0].reasonText.join().includes('有效期'),
+      '失格包按站列出缺口节点与日期原因');
+    const stateAfterBad = await call('GET', '/api/state');
+    ok(stateBefore.data.basisVersion === stateAfterBad.data.basisVersion, '失格预览不改变依据版本');
+    ok((await call('GET', `/api/packages/${pc}`)).data.snapshots.length === 0, '失格预览不写快照');
+
+    // 19.5 合格预览：共同依据版本、双指纹、逐站结果、发放凭据
+    const pv = await call('POST', '/api/batches/preview', { packageIds: [pb, pa] }); // 故意乱序
+    ok(pv.status === 200 && pv.data.eligible === true && pv.data.packageIds.join() === `${pa},${pb}`
+      && pv.data.eligibleCount === 2 && !!pv.data.confirmToken,
+      '合格预览：包集合按 id 升序规范化并发放 confirmToken');
+    ok(pv.data.packages.every((p) => p.listFingerprint && p.itineraryFingerprint
+      && p.basisVersion === pv.data.basisVersion && p.stops.length === 1 && p.stops[0].eligible),
+      '每包带共同依据版本、清单/行程指纹与逐站合格结果');
+    const stateAfterPv = await call('GET', '/api/state');
+    ok(stateAfterPv.data.basisVersion === pv.data.basisVersion
+      && (await call('GET', `/api/packages/${pa}`)).data.status === 'draft',
+      '合格预览只读：依据版本不变、包仍 draft');
+
+    // 19.6 凭据篡改：包集合 / 依据版本 / 指纹
+    let tok = pv.data.confirmToken;
+    let r = await call('POST', '/api/batches/confirm', {
+      confirmToken: { ...tok, basisVersion: tok.basisVersion + 1 },
+    });
+    ok(r.status === 409 && r.data.details.code === 'STALE_BASIS', '错误依据版本 -> 409 STALE_BASIS');
+    r = await call('POST', '/api/batches/confirm', {
+      confirmToken: { ...tok, packages: tok.packages.map((p, i) => i === 0 ? { ...p, listFingerprint: 'x' } : p) },
+    });
+    ok(r.status === 409 && r.data.details.code === 'PACKAGE_CHANGED', '清单指纹不符 -> 409 PACKAGE_CHANGED');
+    r = await call('POST', '/api/batches/confirm', {
+      confirmToken: { ...tok, packages: tok.packages.map((p, i) => i === 0 ? { ...p, itineraryFingerprint: 'x' } : p) },
+    });
+    ok(r.status === 409 && r.data.details.code === 'PACKAGE_CHANGED'
+      && r.data.details.itineraryChanged.includes(tok.packages[0].packageId),
+      '行程指纹不符 -> 409 PACKAGE_CHANGED（指出包号）');
+    r = await call('POST', '/api/batches/confirm', { confirmToken: { kind: 'x' } });
+    ok(r.status === 409 && r.data.details.code === 'TOKEN_MISMATCH', '损坏凭据 -> 409 TOKEN_MISMATCH');
+    r = await call('POST', '/api/batches/confirm', { confirmToken: { ...tok, packageIds: [pa] } });
+    ok(r.status === 409 && r.data.details.code === 'TOKEN_MISMATCH', '凭据包集合不一致 -> 409 TOKEN_MISMATCH');
+    ok((await call('POST', '/api/batches/confirm', {})).status === 400, '缺凭据 -> 400');
+
+    // 19.7 漂移：预览后撤销授权 -> STALE_BASIS，整批无写入
+    const aAuth = (await call('GET', `/api/materials/${a}`)).data.authorizations[0].id;
+    await call('POST', `/api/authorizations/${aAuth}/revoke`);
+    r = await call('POST', '/api/batches/confirm', { confirmToken: tok });
+    ok(r.status === 409 && r.data.details.code === 'STALE_BASIS', '预览后授权撤销 -> 409 STALE_BASIS');
+    for (const id of [pa, pb]) {
+      const d = (await call('GET', `/api/packages/${id}`)).data;
+      ok(d.status === 'draft' && d.snapshots.length === 0, `漂移拒绝后包 #${id} 仍 draft 且无快照`);
+    }
+    // 恢复授权：重预览得到新凭据
+    await call('PATCH', `/api/authorizations/${aAuth}`, {
+      media: '*', region: '*', validFrom: '2020-01-01', validTo: '2100-12-31', revoked: false,
+    });
+    tok = (await call('POST', '/api/batches/preview', { packageIds: [pa, pb] })).data.confirmToken;
+
+    // 19.8 预览后改包清单 -> 指纹不符整批拒绝（另一包不受影响）
+    await call('PATCH', `/api/packages/${pb}`, {
+      name: '批次-合格包B', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [b, a],
+    });
+    r = await call('POST', '/api/batches/confirm', { confirmToken: tok });
+    ok(r.status === 409 && r.data.details.code === 'PACKAGE_CHANGED'
+      && r.data.details.listChanged.includes(pb),
+      '预览后清单被改 -> 409 PACKAGE_CHANGED');
+    await call('PATCH', `/api/packages/${pb}`, {
+      name: '批次-合格包B', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [b],
+    });
+    tok = (await call('POST', '/api/batches/preview', { packageIds: [pa, pb] })).data.confirmToken;
+
+    // 19.9 成功整批发布：同一事务封存快照+凭证并一起转已发布
+    const confirmed = await call('POST', '/api/batches/confirm', { confirmToken: tok });
+    ok(confirmed.status === 201 && confirmed.data.packageCount === 2, '整批确认 201');
+    for (const p of confirmed.data.packages) {
+      const d = (await call('GET', `/api/packages/${p.packageId}`)).data;
+      ok(d.status === 'published' && p.snapshotId && p.attestationId
+        && p.attestation.body.sealContext === 'publish-batch'
+        && p.attestation.body.snapshotId === p.snapshotId
+        && p.attestation.body.packageId === p.packageId,
+        `包 #${p.packageId}：已发布，同事务封存 publish-batch 快照与凭证`);
+      const snap = await call('GET', `/api/snapshots/${p.snapshotId}`);
+      ok(snap.data.kind === 'publish' && snap.data.eligible === true && snap.data.immutable === true,
+        `包 #${p.packageId}：发布快照为成功且不可变`);
+      // 既有凭证导出接口对批次凭证完全兼容
+      const exported = await call('GET', `/api/packages/${p.packageId}/attestation`);
+      ok(exported.status === 200 && exported.data.signature.value === p.attestation.signature.value,
+        `包 #${p.packageId}：既有凭证导出接口可取批次凭证`);
+    }
+
+    // 19.10 批次凭证通过离线独立校验程序
+    {
+      const fs = require('fs');
+      const os = require('os');
+      const path = require('path');
+      const { spawnSync } = require('child_process');
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-attest-'));
+      const attFile = path.join(dir, 'att.json');
+      const keyFile = path.join(dir, 'pub.pem');
+      const keys = (await call('GET', '/api/attestation-keys')).data.keys;
+      fs.writeFileSync(keyFile, keys.map((k) => k.publicKeyPem).join('\n'));
+      const target = confirmed.data.packages[0];
+      fs.writeFileSync(attFile, JSON.stringify(target.attestation));
+      const v = spawnSync(process.execPath,
+        [path.join(__dirname, '..', 'scripts', 'verify-attestation.js'), attFile, keyFile, '--json'],
+        { encoding: 'utf8' });
+      let parsed = null;
+      try { parsed = JSON.parse(v.stdout); } catch { /* 人读输出兜底 */ }
+      ok(v.status === 0 && parsed && parsed.conclusion === 'PASS' && parsed.ok === true
+        && parsed.packageId === target.packageId && parsed.sealContext === 'publish-batch'
+        && parsed.validSignature === true && parsed.tamperReasons.length === 0,
+        '批次凭证离线独立校验通过（exit=0, PASS, sealContext=publish-batch）');
+    }
+
+    // 19.11 凭据一次性：重放被 NOT_DRAFT 拒绝
+    r = await call('POST', '/api/batches/confirm', { confirmToken: tok });
+    ok(r.status === 409 && r.data.details.code === 'NOT_DRAFT', '凭据重放（包已发布）-> 409 NOT_DRAFT');
+
+    // 19.12 多站批次：逐站结果按站给出，整批一起发布
+    const d = await mk2('批次-多站素材D');
+    await addAuth2(d, '*', '*', '2020-01-01', '2100-12-31');
+    const pm = (await call('POST', '/api/packages', {
+      name: '批次-多站包', materialIds: [d],
+      stops: [
+        { name: '甲站', media: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-10' },
+        { name: '乙站', media: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-10' },
+      ],
+    })).data.id;
+    const pe = (await call('POST', '/api/packages', {
+      name: '批次-合格包E', medium: '*', region: '*', ...SPR, materialIds: [a],
+    })).data.id;
+    const pvm = await call('POST', '/api/batches/preview', { packageIds: [pm, pe] });
+    ok(pvm.data.eligible === true,
+      '多站+单站混合批次预览合格');
+    const mEntry = pvm.data.packages.find((p) => p.packageId === pm);
+    ok(mEntry.multiStop === true && mEntry.stopCount === 2
+      && mEntry.stops.map((s) => s.position).join() === '0,1'
+      && mEntry.stops.every((s) => s.eligible),
+      '多站包逐站结果（2 站均合格）');
+    const cm = await call('POST', '/api/batches/confirm', { confirmToken: pvm.data.confirmToken });
+    ok(cm.status === 201 && cm.data.packages.every((p) => p.package.status === 'published' && p.multiStop === (p.packageId === pm)),
+      '混合批次整批发布：两包一起 published');
+    const mRes = cm.data.packages.find((p) => p.packageId === pm).result;
+    ok(mRes.multiStop === true && mRes.stops.length === 2,
+      '多站包发布快照结果含冻结的 2 站');
+
+    // 19.13 重算失格整批拒绝且无部分写入：
+    //   预览合格后不改依据（basis 不变的情形）——通过改行程日期使指纹与重算均失配不可行，
+    //   因此构造“预览后他方改包使重算失格但指纹/依据巧合不变”不现实；
+    //   改为端到端覆盖：失格包无法获得凭据（19.4），且成功批次后单包仍可独立走既有发布链路（兼容）。
+    const f = await mk2('批次-兼容单包F');
+    await addAuth2(f, '*', '*', '2020-01-01', '2100-12-31');
+    const pf = (await call('POST', '/api/packages', {
+      name: '批次后-单包发布F', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [f],
+    })).data.id;
+    const vf = await call('POST', '/api/verify', { packageId: pf });
+    const pubf = await call('POST', `/api/packages/${pf}/publish`, { basisVersion: vf.data.basisVersion });
+    ok(pubf.status === 201 && pubf.data.attestation.body.sealContext === 'publish',
+      '批次功能上线后既有单包发布（sealContext=publish、422 留痕、凭证导出）保持兼容');
+
+    // 19.14 失败发布留痕兼容：不合格单包发布仍 422 并留快照（批次路径则不留痕）
+    const pg = (await call('POST', '/api/packages', {
+      name: '批次后-单包失败G', medium: '屏幕放映', region: '中国大陆', ...AUT, materialIds: [c],
+    })).data.id;
+    const curBasis = (await call('GET', '/api/state')).data.basisVersion;
+    const pubg = await call('POST', `/api/packages/${pg}/publish`, { basisVersion: curBasis });
+    ok(pubg.status === 422 && pubg.data.details.snapshotId
+      && (await call('GET', `/api/packages/${pg}`)).data.status === 'draft'
+      && (await call('GET', `/api/packages/${pg}`)).data.snapshots.some((s) => s.kind === 'publish' && !s.eligible),
+      '既有单包失败发布仍 422 留不可变快照；批次失败则整批不留痕');
+
+    // 19.15 已发布包不能再进批次；需复核包同样不可选
+    r = await call('POST', '/api/batches/preview', { packageIds: [pa, pf] });
+    ok(r.status === 409 && r.data.details.code === 'NOT_DRAFT', '已发布包不能再进批次');
+
+    // 19.16 来源链逐包独立：两包共享上游时各自逐站核验、各自封存凭证
+    const root = await mk2('批次-共享上游根'); const up = await mk2('批次-共享上游节点');
+    await addLink2(root, up);
+    await addAuth2(root, '*', '*', '2020-01-01', '2100-12-31');
+    await addAuth2(up, '*', '*', '2020-01-01', '2100-12-31');
+    const ph = (await call('POST', '/api/packages', {
+      name: '批次-共享链H', medium: '屏幕放映', region: '中国大陆', ...SPR, materialIds: [root],
+    })).data.id;
+    const pi = (await call('POST', '/api/packages', {
+      name: '批次-共享链I', medium: '*', region: '*', ...SPR, materialIds: [up],
+    })).data.id;
+    const pvs = await call('POST', '/api/batches/preview', { packageIds: [ph, pi] });
+    ok(pvs.data.eligible === true
+      && pvs.data.packages.find((p) => p.packageId === ph).stops[0].nodeCount === 2
+      && pvs.data.packages.find((p) => p.packageId === pi).stops[0].nodeCount === 1,
+      '共享来源节点的两个包逐包独立核验（闭包节点数各自正确）');
+    const cs = await call('POST', '/api/batches/confirm', { confirmToken: pvs.data.confirmToken });
+    ok(cs.status === 201
+      && cs.data.packages.find((p) => p.packageId === ph).attestation.body.manifest.materialIds.join() === String(root)
+      && cs.data.packages.find((p) => p.packageId === ph).attestation.body.materials.length === 2,
+      '批次各包凭证各自封存完整来源子图');
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

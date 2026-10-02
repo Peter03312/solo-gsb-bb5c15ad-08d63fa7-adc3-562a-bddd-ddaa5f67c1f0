@@ -80,6 +80,20 @@
       </div>
 
       <div id="verifyPanel" class="panel hidden"></div>
+
+      <div class="panel">
+        <div class="pkg-head">
+          <h2>联展批次发布（2～20 个待发布包）</h2>
+          <div class="pkg-actions">
+            <button type="button" class="btn btn-primary" id="batchFormBtn">组建联展批次并预览</button>
+          </div>
+        </div>
+        <div class="small-muted">
+          勾选 2～20 个待发布展览包组成联展批次：预览按包展示单站或多站逐站核验结果、共同依据版本与各包清单/行程指纹；
+          只要有包失格即列出缺口并禁止确认（预览不写入任何数据）。确认携带预览凭据，服务端在同一事务内核对包集合、待发布状态、依据版本与各包指纹并重算全部包，全部合格才一起封存不可变快照与签名凭证并转为已发布；任一不符整批拒绝、无部分发布。
+        </div>
+      </div>
+
       <div id="packagesList" class="stack"></div>
     </section>
   </main>

@@ -138,3 +138,6 @@ pre.json { background: #0f172a; color: #dbeafe; padding: 12px; border-radius: 8p
 #quoteTable select, #quoteTable input { width: 100%; box-sizing: border-box; }
 #quoteTable td { vertical-align: middle; }
 #quoteTable .quote-row td { padding: 4px 6px; }
+
+/* 联展批次选择 */
+#batchPick label.pick-disabled { opacity: .45; cursor: not-allowed; text-decoration: line-through; }

@@ -20,6 +20,7 @@ const { previewChange, commitChange, ChangeError } = require('./changes');
 const { searchSchedule, applySchedule, ScheduleError } = require('./schedule');
 const { previewQuotes, QuoteError } = require('./quotes');
 const { previewSubstitutions, applySubstitutions, SubstituteError } = require('./substitutes');
+const { previewBatch, confirmBatch, BatchError } = require('./batch');
 const keyring = require('./attest-keys');
 const { buildAttestation, buildAttestationFromSnapshot, UnsupportedSnapshotError } = require('./attest');
 
@@ -762,6 +763,39 @@ app.post('/api/packages/:id/substitutes/apply', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 联展批次：只读预览（逐包逐站核验、共同依据版本、双指纹）/ 单事务整批发布 ----------
+app.post('/api/batches/preview', (req, res, next) => {
+  try {
+    const result = previewBatch(db, req.body || {});
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/batches/confirm', (req, res, next) => {
+  try {
+    const out = confirmBatch(db, req.body || {});
+    res.status(201).json({
+      ok: true,
+      mutated: true,
+      message: `联展批次发布成功：${out.packageCount} 个包已在同一事务内封存不可变发布快照与签名凭证，并一起转为已发布（任一包失败都会整批回滚）。`,
+      sealedAt: out.sealedAt,
+      basisVersion: out.basisVersion,
+      packageIds: out.packageIds,
+      packageCount: out.packageCount,
+      packages: out.packages.map((p) => ({
+        packageId: p.packageId,
+        packageName: p.packageName,
+        multiStop: p.multiStop,
+        snapshotId: p.snapshotId,
+        attestationId: p.attestationId,
+        attestation: p.attestation,
+        package: packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(p.packageId), true),
+        result: p.result,
+      })),
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 快照 ----------
 app.get('/api/snapshots/:id', (req, res, next) => {
   try {
@@ -888,7 +922,8 @@ app.post('/api/attestation-keys/rotate', (req, res, next) => {
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
   if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError
-    || err instanceof QuoteError || err instanceof SubstituteError || err instanceof UnsupportedSnapshotError) {
+    || err instanceof QuoteError || err instanceof SubstituteError || err instanceof BatchError
+    || err instanceof UnsupportedSnapshotError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {
